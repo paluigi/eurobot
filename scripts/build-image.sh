@@ -16,14 +16,21 @@ IMAGE="paluugi/eurobot"
 EPOCH=946684800   # must match SOURCE_DATE_EPOCH in the Dockerfile
 
 VERSION="${1:-$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)}"
+PUSH="${2:-}"
 
-docker build \
-  --build-arg SOURCE_DATE_EPOCH="$EPOCH" \
-  -t "$IMAGE:$VERSION" \
-  -t "$IMAGE:latest" \
-  .
+# --provenance=false --sbom=false: build attestations embed build timestamps
+# and would change the pushed digest on every rebuild.
+ARGS=(
+  --provenance=false
+  --sbom=false
+  --build-arg SOURCE_DATE_EPOCH="$EPOCH"
+  -t "$IMAGE:$VERSION"
+  -t "$IMAGE:latest"
+)
 
-if [[ "${2:-}" == "--push" ]]; then
+docker build "${ARGS[@]}" .
+
+if [[ "$PUSH" == "--push" ]]; then
   docker push "$IMAGE:$VERSION"
   docker push "$IMAGE:latest"
 fi

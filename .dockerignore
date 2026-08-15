@@ -9,3 +9,6 @@ __pycache__/
 .pytest_cache/
 # Live cascade config (users mount their own; the example ships in the image)
 config/llm-pycascade.toml
+
+# local agent workspace
+.zcode/
