@@ -1,15 +1,13 @@
 """Tests for dedup logic — news cooldown + macro release freshness."""
 
-import os
-import tempfile
 from datetime import datetime, timedelta
 
 import pandas as pd
 import pytest
 
 from eurobot import config
-from eurobot.pipeline import dedup
 from eurobot.fetchers.rss_fetcher import NewsItem
+from eurobot.pipeline import dedup
 
 
 @pytest.fixture(autouse=True)

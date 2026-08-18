@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1
 # Reproducible-image notes:
 #   - Base image pinned by digest (refresh: docker manifest inspect python:3.12-slim)
-#   - supercronic pinned by release URL + sha256
 #   - Dependencies pinned by uv.lock (committed)
 #   - All files enter via RUN + bind mounts and every layer's mtimes are
 #     normalized to SOURCE_DATE_EPOCH: identical inputs → identical digest.
@@ -19,10 +18,9 @@ LABEL org.opencontainers.image.licenses="MIT"
 # contents, never on the build clock.
 ENV SOURCE_DATE_EPOCH=946684800
 
-# curl is used to fetch supercronic below (and for healthchecks). Remove
-# apt logs, state and the random machine-id so the layer is deterministic.
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb \
+# Strip apt state and the random machine-id so the layer is deterministic.
+# (No apt packages needed since supercronic was dropped for APScheduler.)
+RUN rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb \
     && rm -f /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
     && rm -f /var/cache/ldconfig/aux-cache \
     && : > /etc/machine-id \
@@ -37,24 +35,19 @@ WORKDIR /app
 # mounts instead of COPY (COPY layers stamp parent-directory mtimes with
 # the build clock, which would make the digests non-reproducible).
 # uv_cache.json and its RECORD entry embed build timestamps — drop both.
+# Scheduling is APScheduler inside python -m eurobot.scheduler (no cron
+# daemon needed since 0.2.0).
 RUN --mount=type=bind,source=src,target=/ctx-src \
     --mount=type=bind,source=config,target=/ctx-config \
     --mount=type=bind,source=pyproject.toml,target=/ctx-pyproject.toml \
     --mount=type=bind,source=uv.lock,target=/ctx-uv.lock \
-    --mount=type=bind,source=crontab,target=/ctx-crontab \
     --mount=type=bind,from=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1,source=/uv,target=/uvbin \
     set -eux; \
     cp /uvbin /usr/local/bin/uv; \
-    curl -fsSL -o /usr/local/bin/supercronic \
-      "https://github.com/aptible/supercronic/releases/download/v0.2.49/supercronic-linux-amd64"; \
-    echo "a53ae236602c7338aba3fbaff40bda6300eae3b9fedb8261eb06cfe3724430c1  /usr/local/bin/supercronic" \
-      | sha256sum -c -; \
-    chmod 0755 /usr/local/bin/supercronic; \
     cp -a /ctx-src ./src; \
     cp -a /ctx-config ./config; \
     cp /ctx-pyproject.toml ./pyproject.toml; \
     cp /ctx-uv.lock ./uv.lock; \
-    cp /ctx-crontab ./crontab; \
     uv export --frozen --no-emit-project --format requirements-txt > /tmp/requirements.lock; \
     uv pip install --system --no-cache -r /tmp/requirements.lock; \
     uv pip install --system --no-cache --no-deps /app; \
@@ -72,6 +65,6 @@ ENV EUROBOT_CONFIG_DIR=/app/config \
 # Volume mount points
 VOLUME ["/app/config", "/app/data"]
 
-# supercronic: container-native cron (reads /app/crontab once at startup,
-# logs job output to stdout, no syslog/PAM machinery)
-CMD ["/usr/local/bin/supercronic", "/app/crontab"]
+# APScheduler entry point — daily runs at 08:00/13:00/18:00 UTC
+# (override with SCHEDULE_HOURS; RUN_ON_START=1 for an immediate run)
+CMD ["python", "-m", "eurobot.scheduler"]

@@ -8,7 +8,7 @@ publish raises ``StageFailure`` without discarding earlier stages.
 
 import pytest
 
-import eurobot.main as main
+from eurobot import main
 from eurobot.main import StageFailure, _report_and_publish
 
 

@@ -29,6 +29,7 @@ from eurobot.pipeline import dedup
 from eurobot.pipeline.payload_builder import assemble_payload, save_payload
 from eurobot.publish.zzboard_client import publish_payload
 from eurobot.llm.cascade_runner import query_llm
+from eurobot.llm.parser import parse_json_safe as _parse_json_safe
 from eurobot.llm import prompts
 
 logger = config.setup_logging()
@@ -300,37 +301,6 @@ def _report_and_publish(
     logger.info("eurobot pipeline completed successfully")
     logger.info("=" * 60)
     return 0
-
-
-def _parse_json_safe(text: str, prefer: type | None = None) -> list | dict | None:
-    """Extract and parse JSON from an LLM response.
-
-    Tolerates reasoning-model ``<think>`` blocks (even with the JSON inside
-    them), markdown code fences, and surrounding prose: collects every
-    complete JSON value found and returns the last one — models place the
-    final answer at the end. If ``prefer`` (list or dict) is given, only
-    candidates of that type are considered.
-    """
-    import re
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    decoder = json.JSONDecoder()
-    candidates = []
-    for match in re.finditer(r"[\[{]", text):
-        try:
-            obj, _ = decoder.raw_decode(text, match.start())
-            candidates.append(obj)
-        except json.JSONDecodeError:
-            continue
-    if prefer is not None:
-        candidates = [c for c in candidates if isinstance(c, prefer)]
-    if candidates:
-        return candidates[-1]
-    logger.error("Could not parse JSON from LLM response: %s", text[:200])
-    return None
 
 
 if __name__ == "__main__":

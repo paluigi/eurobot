@@ -4,7 +4,11 @@ import pandas as pd
 import pytest
 
 from eurobot.stats.compute import compute_stats_for_series
-from eurobot.viz.plotly_charts import make_line_chart, make_summary_table, make_delta_bar_chart
+from eurobot.viz.plotly_charts import (
+    make_delta_bar_chart,
+    make_line_chart,
+    make_summary_table,
+)
 
 
 @pytest.fixture

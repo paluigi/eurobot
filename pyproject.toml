@@ -1,6 +1,6 @@
 [project]
 name = "eurobot"
-version = "0.1.3"
+version = "0.2.0"
 description = "Autonomous euro-area economic reporting pipeline"
 requires-python = ">=3.11"
 dependencies = [
@@ -8,10 +8,13 @@ dependencies = [
     "pandas>=2.2.0",
     "plotly>=5.24.0",
     "feedparser>=6.0.11",
-    "llm-pycascade>=0.1.0",
+    "llm-pycascade>=0.2.0",
     "requests>=2.32.0",
     "python-dotenv>=1.0.1",
     "tenacity>=8.2.0",
+    "apscheduler>=3.10,<4",
+    "asyncpg>=0.30.0",
+    "pymongo>=4.9",
 ]
 
 [project.optional-dependencies]

@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import pandas as pd
 import requests
 
+from eurobot.utils.retries import call_with_retries
+
 logger = logging.getLogger(__name__)
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -31,7 +33,9 @@ class MarketSpec:
 
 # Yahoo Finance tickers — verified live on 2026-08-13.
 MARKET_SPECS: list[MarketSpec] = [
-    MarketSpec("FTSE_MIB", "FTSEMIB.MI", "FTSE MIB — Italian equity benchmark", "index points"),
+    MarketSpec(
+        "FTSE_MIB", "FTSEMIB.MI", "FTSE MIB — Italian equity benchmark", "index points"
+    ),
     MarketSpec("BRENT", "BZ=F", "Brent crude oil futures", "USD/bbl"),
     # EUR/USD is also fetched from ECB SDMX; Yahoo is a cross-check
     MarketSpec("EUR_USD_MKT", "EURUSD=X", "EUR/USD (market source)", "USD per EUR"),
@@ -42,9 +46,11 @@ def _download_yahoo(symbol: str, range_days: str = "6mo") -> pd.DataFrame | None
     """Download historical daily data from Yahoo Finance.
 
     Uses the undocumented chart API (no key needed).  Returns a DataFrame with
-    columns: Open, High, Low, Close, Adj Close, Volume.
+    columns: Open, High, Low, Close, Adj Close, Volume.  The HTTP call is
+    retried on transient failures (network / 5xx / 429) with bounded tenacity.
     """
-    try:
+
+    def _fetch() -> pd.DataFrame:
         resp = requests.get(
             YAHOO_CHART_URL.format(symbol=symbol),
             params={"range": range_days, "interval": "1d"},
@@ -58,18 +64,28 @@ def _download_yahoo(symbol: str, range_days: str = "6mo") -> pd.DataFrame | None
         timestamps = result["timestamp"]
         quote = result["indicators"]["quote"][0]
 
-        df = pd.DataFrame({
-            "Open": quote["open"],
-            "High": quote["high"],
-            "Low": quote["low"],
-            "Close": quote["close"],
-            "Volume": quote["volume"],
-        }, index=pd.to_datetime(timestamps, unit="s"))
+        df = pd.DataFrame(
+            {
+                "Open": quote["open"],
+                "High": quote["high"],
+                "Low": quote["low"],
+                "Close": quote["close"],
+                "Volume": quote["volume"],
+            },
+            index=pd.to_datetime(timestamps, unit="s"),
+        )
         df.index.name = "Date"
-        df = df.dropna(subset=["Close"])
+        return df.dropna(subset=["Close"])
 
-        logger.info("Yahoo: %s — %d obs [%s → %s]",
-                     symbol, len(df), df.index[0].date(), df.index[-1].date())
+    try:
+        df = call_with_retries(_fetch)
+        logger.info(
+            "Yahoo: %s — %d obs [%s → %s]",
+            symbol,
+            len(df),
+            df.index[0].date(),
+            df.index[-1].date(),
+        )
         return df
     except Exception as exc:
         logger.warning("Yahoo: failed %s — %s", symbol, exc)
@@ -86,14 +102,16 @@ def fetch_all_markets(range_days: str = "6mo") -> list[dict]:
     for spec in MARKET_SPECS:
         df = _download_yahoo(spec.yahoo_symbol, range_days)
         if df is not None and not df.empty:
-            items.append({
-                "tag": spec.tag,
-                "title": spec.title,
-                "unit": spec.unit,
-                "df": df,
-                "series": df["Close"],
-                "spec": spec,
-            })
+            items.append(
+                {
+                    "tag": spec.tag,
+                    "title": spec.title,
+                    "unit": spec.unit,
+                    "df": df,
+                    "series": df["Close"],
+                    "spec": spec,
+                }
+            )
         else:
             logger.warning("Yahoo: skipping %s (no data)", spec.tag)
     logger.info("Yahoo: %d/%d instruments fetched", len(items), len(MARKET_SPECS))
@@ -116,6 +134,5 @@ def compute_btp_bund_spread(
     aligned.columns = ["BTP", "Bund"]
     spread = aligned["BTP"] - aligned["Bund"]
     spread.name = "BTP_BUND_SPREAD"
-    logger.info("BTP-Bund spread: %d obs, latest %.2f pp",
-                len(spread), spread.iloc[-1])
+    logger.info("BTP-Bund spread: %d obs, latest %.2f pp", len(spread), spread.iloc[-1])
     return spread

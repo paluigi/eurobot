@@ -1,0 +1,113 @@
+# Windmill flow — eurobot daily post (OpenFlow format)
+#
+# Import: Flow editor → "Edit in YAML" → paste, or CLI:
+#   wmill flow create u/eurobot/daily_post --path windmill/flow.yaml
+#
+# Workspace variables required (Settings → Variables, path u/eurobot/*):
+#   postgres_dsn   — postgres://user:pass@host:5432/eurobot
+#   mongo_uri      — mongodb://user:pass@host:27017
+#   zzboard_token  — secret API token
+#   cascade_config — JSON dict (llm-pycascade >=0.2.0 dict schema, see
+#                    windmill/README.md)
+#
+# The four step scripts (fetch_data, compute_stats, llm_report,
+# publish_archive) and common.py must be synced to the workspace at
+# u/eurobot/* (windmill/README.md has the wmill sync commands).
+
+summary: eurobot — fetch → stats → LLM report → publish + archive
+description: |
+  Daily euro-area economic post.
+
+  1. fetch_data — SDMX/Yahoo/RSS → PostgreSQL + Mongo helper doc
+  2. compute_stats — stats/charts/tables + freshness filter (PG-backed dedup)
+  3. llm_report — 3-stage LLM cascade (dict-based config, :memory: DB)
+  4. publish_archive — zzboard POST → Mongo `posts` archive → drop the
+     `flow_state` helper collection
+
+value:
+  modules:
+    - id: fetch
+      summary: Fetch SDMX + Yahoo + RSS into PostgreSQL
+      value:
+        type: script
+        path: u/eurobot/fetch_data
+        input_transforms:
+          postgres_dsn:
+            type: javascript
+            expr: variable('u/eurobot/postgres_dsn')
+          mongo_uri:
+            type: javascript
+            expr: variable('u/eurobot/mongo_uri')
+
+    - id: stats
+      summary: Compute stats/charts + freshness filter
+      value:
+        type: script
+        path: u/eurobot/compute_stats
+        input_transforms:
+          postgres_dsn:
+            type: javascript
+            expr: variable('u/eurobot/postgres_dsn')
+          mongo_uri:
+            type: javascript
+            expr: variable('u/eurobot/mongo_uri')
+          run_id:
+            type: javascript
+            expr: results.fetch.run_id
+
+    - id: llm
+      summary: 3-stage LLM report (dict cascade config)
+      value:
+        type: script
+        path: u/eurobot/llm_report
+        input_transforms:
+          mongo_uri:
+            type: javascript
+            expr: variable('u/eurobot/mongo_uri')
+          run_id:
+            type: javascript
+            expr: results.fetch.run_id
+          cascade_config:
+            type: javascript
+            expr: variable('u/eurobot/cascade_config')
+          max_attempts:
+            type: static
+            value: 4
+
+    - id: publish
+      summary: Publish to zzboard, archive JSON, drop helper collection
+      value:
+        type: script
+        path: u/eurobot/publish_archive
+        input_transforms:
+          postgres_dsn:
+            type: javascript
+            expr: variable('u/eurobot/postgres_dsn')
+          mongo_uri:
+            type: javascript
+            expr: variable('u/eurobot/mongo_uri')
+          run_id:
+            type: javascript
+            expr: results.fetch.run_id
+          zzboard_api_token:
+            type: javascript
+            expr: variable('u/eurobot/zzboard_token')
+          max_attempts:
+            type: static
+            value: 3
+          dry_run:
+            type: javascript
+            expr: flow_input.dry_run ?? false
+      retry:
+        exponential:
+          attempts: 2
+          multiplier: 2
+          seconds: 5
+
+schema:
+  type: object
+  properties:
+    dry_run:
+      type: boolean
+      description: Skip the zzboard POST (still archives + cleans up)
+      default: false

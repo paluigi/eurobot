@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from eurobot.pipeline.payload_builder import assemble_payload
 from eurobot.fetchers.rss_fetcher import NewsItem
+from eurobot.pipeline.payload_builder import assemble_payload
 
 
 @pytest.fixture

@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 import feedparser
 
+from eurobot.utils.retries import call_with_retries
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -39,21 +41,58 @@ FEEDS: dict[str, str] = {
 # Case-insensitive.  This is a pre-LLM filter to reduce noise.
 RELEVANCE_KEYWORDS = [
     # English
-    "euro area", "eurozone", "eurozone", "euro zone",
-    "european central bank", "ecb", "european commission",
-    "inflation", "hicp", "gdp", "recession", "monetary policy",
-    "interest rate", "bond yield", "spread", "sovereign",
-    "btp", "bund", "mib", "italian", "italy",
-    "euro", "eur", "currency", "forex",
-    "unemployment", "labour market", "labor market",
-    "energy", "oil", "gas", "brent",
-    "economic", "economy", "financial",
+    "euro area",
+    "eurozone",
+    "eurozone",
+    "euro zone",
+    "european central bank",
+    "ecb",
+    "european commission",
+    "inflation",
+    "hicp",
+    "gdp",
+    "recession",
+    "monetary policy",
+    "interest rate",
+    "bond yield",
+    "spread",
+    "sovereign",
+    "btp",
+    "bund",
+    "mib",
+    "italian",
+    "italy",
+    "euro",
+    "eur",
+    "currency",
+    "forex",
+    "unemployment",
+    "labour market",
+    "labor market",
+    "energy",
+    "oil",
+    "gas",
+    "brent",
+    "economic",
+    "economy",
+    "financial",
     # Italian
-    "economia", "inflazione", "spread", "bcc", "bce",
-    "pil", "disoccupazione", "titoli di stato", "rendimenti",
-    "area euro", "zona euro",
+    "economia",
+    "inflazione",
+    "spread",
+    "bcc",
+    "bce",
+    "pil",
+    "disoccupazione",
+    "titoli di stato",
+    "rendimenti",
+    "area euro",
+    "zona euro",
     # French / German
-    "wirtschaft", "inflation", "économie", "inflation",
+    "wirtschaft",
+    "inflation",
+    "économie",
+    "inflation",
 ]
 
 
@@ -61,12 +100,12 @@ RELEVANCE_KEYWORDS = [
 class NewsItem:
     """A single news item extracted from RSS."""
 
-    tag: str          # e.g. "NEWS_001"
+    tag: str  # e.g. "NEWS_001"
     title: str
     summary: str
     link: str
-    source: str       # feed name
-    hash: str         # dedup hash of title+link
+    source: str  # feed name
+    hash: str  # dedup hash of title+link
 
     def to_prompt_line(self) -> str:
         """One-line representation for the LLM selection prompt."""
@@ -78,6 +117,7 @@ class NewsItem:
 # ---------------------------------------------------------------------------
 # Fetching
 # ---------------------------------------------------------------------------
+
 
 def _is_relevant(title: str, summary: str) -> bool:
     """Check if a news item matches the euro-area economic relevance filter."""
@@ -109,17 +149,30 @@ def get_latest_news(max_items: int = 15) -> list[NewsItem]:
 
     for source_name, feed_url in FEEDS.items():
         try:
-            # Use requests with a proper User-Agent, then pass content to feedparser
+            # Use requests with a proper User-Agent, then pass content to
+            # feedparser. Retried on transient failures with bounded tenacity.
             import requests as req_mod
-            resp = req_mod.get(feed_url, timeout=15, headers={"User-Agent": "eurobot/0.1"})
-            parsed = feedparser.parse(resp.content)
+
+            def _get(url: str):
+                resp = req_mod.get(
+                    url, timeout=15, headers={"User-Agent": "eurobot/0.1"}
+                )
+                resp.raise_for_status()
+                return resp.content
+
+            content = call_with_retries(_get, feed_url)
+            parsed = feedparser.parse(content)
             if parsed.bozo and not parsed.entries:
-                logger.warning("RSS: feed error for %s — %s", source_name, parsed.bozo_exception)
+                logger.warning(
+                    "RSS: feed error for %s — %s", source_name, parsed.bozo_exception
+                )
                 continue
 
             for entry in parsed.entries[:10]:  # max 10 per source
                 title = entry.get("title", "").strip()
-                summary = _clean_html(entry.get("summary", entry.get("description", "")))
+                summary = _clean_html(
+                    entry.get("summary", entry.get("description", ""))
+                )
                 link = entry.get("link", "")
 
                 if not title or not link:
@@ -134,14 +187,16 @@ def get_latest_news(max_items: int = 15) -> list[NewsItem]:
                     continue
                 seen_hashes.add(h)
 
-                items.append(NewsItem(
-                    tag="",  # assigned after collection
-                    title=title,
-                    summary=summary,
-                    link=link,
-                    source=source_name,
-                    hash=h,
-                ))
+                items.append(
+                    NewsItem(
+                        tag="",  # assigned after collection
+                        title=title,
+                        summary=summary,
+                        link=link,
+                        source=source_name,
+                        hash=h,
+                    )
+                )
         except Exception as exc:
             logger.warning("RSS: failed %s — %s", source_name, exc)
 
@@ -149,6 +204,9 @@ def get_latest_news(max_items: int = 15) -> list[NewsItem]:
     for i, item in enumerate(items[:max_items], start=1):
         item.tag = f"NEWS_{i:03d}"
 
-    logger.info("RSS: collected %d relevant items (from %d feeds)",
-                len(items[:max_items]), len(FEEDS))
+    logger.info(
+        "RSS: collected %d relevant items (from %d feeds)",
+        len(items[:max_items]),
+        len(FEEDS),
+    )
     return items[:max_items]

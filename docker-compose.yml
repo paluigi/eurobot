@@ -10,6 +10,9 @@
 #   - SQLite DBs + log  → named volume `eurobot_data` (managed by Docker)
 #   - Audit post JSONs  → bind-mounted ./data/posts (inspect on the host)
 #   - LLM config        → bind-mounted ./config (read-only)
+#
+# The container schedules itself with APScheduler (08:00/13:00/18:00 UTC;
+# override via SCHEDULE_HOURS, immediate first run via RUN_ON_START=1).
 
 services:
   eurobot:

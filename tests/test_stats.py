@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-from eurobot.stats.compute import compute_stats_for_series, SeriesStats
+from eurobot.stats.compute import compute_stats_for_series
 
 
 @pytest.fixture
