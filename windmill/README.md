@@ -2,10 +2,12 @@
 
 The same euro-area reporting pipeline, re-arranged as a [Windmill](https://www.windmill.dev) flow. The classic single-container pipeline (`python -m eurobot.scheduler`) remains fully supported; this folder runs the same logic as four discrete Windmill scripts with two databases:
 
-- **PostgreSQL** — data layer: series registry, observations, news items, stats, dedup state, run log (`schema.sql`)
+- **PostgreSQL** — data layer: series registry, observations, news items, stats, dedup state, run log (schema embedded in each script)
 - **MongoDB** — inter-step handoff (`flow_state` helper collection, one doc per run) + the persistent post archive (`posts` collection, final JSON of every published post)
 
 The helper collection is dropped by the final step once the post is published and archived — the handoff data never outlives a successful flow.
+
+Every step script is **fully self-contained**: the PostgreSQL schema (`SCHEMA_SQL`), the Mongo handoff helpers (`FlowStore`, `pg_connect`, `mongo_client`) and all domain code (fetchers, stats, chart builders, LLM prompts) are defined inside each script — there is no eurobot package to install, no shared module and no external SQL/config file, so any script can be pasted into Windmill and run standalone. The only dependencies are published PyPI libraries.
 
 ## Flow steps
 
@@ -18,30 +20,26 @@ The helper collection is dropped by the final step once the post is published an
 
 Scripts take explicit arguments (`postgres_dsn`, `mongo_uri`, `run_id`, …) — no ambient config — and return JSON-serialisable results. All network calls use bounded tenacity retries (capped attempts, exponential backoff); the LLM stages resume from the last valid stage on retry.
 
-## LLM cascade — dict config (llm-pycascade ≥ 0.2.0)
+## LLM cascade — config defined in `llm_report.py` (llm-pycascade ≥ 0.2.0)
 
-Step 3 configures the cascade via `config_from_dict()` (new in llm-pycascade 0.2.0) with a `:memory:` database — no TOML file or persistent state on the ephemeral Windmill worker. The dict is a Windmill variable with exactly the TOML schema:
+Step 3 configures the cascade via `config_from_dict()` with a `:memory:` database — no TOML file or persistent state on the ephemeral Windmill worker. The config is **built inside the script** from two editable tables at the top of `llm_report.py`:
 
-```json
-{
-  "providers": {
-    "groq":     { "type": "openai", "api_key_env": "GROQ_API_KEY", "base_url": "https://api.groq.com/openai/v1" },
-    "together": { "type": "openai", "api_key_env": "TOGETHER_API_KEY", "base_url": "https://api.together.xyz/v1" }
-  },
-  "cascades": {
-    "default": {
-      "entries": [
-        { "provider": "together", "model": "deepseek-ai/DeepSeek-V4-Flash-0731" },
-        { "provider": "groq", "model": "qwen/qwen3.6-27b" }
-      ]
-    }
-  },
-  "database": { "path": ":memory:" },
-  "failure_persistence": { "dir": "/tmp/llm-pycascade/failed_prompts" }
+```python
+PROVIDERS = {
+    "groq":     {"base_url": "https://api.groq.com/openai/v1",
+                 "api_key_variable": "u/eurobot/groq_api_key"},
+    "together": {"base_url": "https://api.together.xyz/v1",
+                 "api_key_variable": "u/eurobot/together_api_key"},
 }
+CASCADE_ENTRIES = [
+    {"provider": "together", "model": "deepseek-ai/DeepSeek-V4-Flash-0731"},
+    {"provider": "together", "model": "Prism-ML/Ternary-Bonsai-27B"},
+    {"provider": "groq", "model": "qwen/qwen3.6-27b"},
+    {"provider": "groq", "model": "openai/gpt-oss-120b"},
+]
 ```
 
-`api_key` may also be given inline with `"api_key_literal": true` when a secrets manager injects the key value at runtime (stored masked as `SecretStr`).
+API keys are Windmill **secret variables**, fetched at runtime with `wmill.get_variable()` and injected with `"api_key_literal": true` (stored masked as `SecretStr` — no environment variables on the worker, and no key arguments in the flow wiring). To add a provider: create its secret variable, add one `PROVIDERS` entry pointing at it, and reference it from `CASCADE_ENTRIES`. To change the model order, edit `CASCADE_ENTRIES` — first entry is tried first.
 
 ## Deploying to Windmill
 
@@ -54,8 +52,8 @@ wmill sync push
 wmill variable create u/eurobot/postgres_dsn --value 'postgres://user:***@host:5432/eurobot' --secret
 wmill variable create u/eurobot/mongo_uri --value 'mongodb://user:***@host:27017' --secret
 wmill variable create u/eurobot/zzboard_token --value '***' --secret
-# cascade_config is a JSON variable — create it in the UI, or:
-#   wmill variable create u/eurobot/cascade_config --json @cascade_config.example.json
+wmill variable create u/eurobot/groq_api_key --value '***' --secret
+wmill variable create u/eurobot/together_api_key --value '***' --secret
 
 # 3. Create the flow from flow.yaml
 wmill flow create u/eurobot/daily_post --path windmill/flow.yaml
@@ -64,7 +62,7 @@ wmill flow create u/eurobot/daily_post --path windmill/flow.yaml
 # 4. Schedule it (Schedules → New): 08:00, 13:00, 18:00 UTC
 ```
 
-The Python worker needs the eurobot package (fetchers/stats/viz/prompts) plus its dependencies. Either bake them into a custom worker image, or keep the default worker and let the scripts install them at startup — simplest is a custom image based on `ghcr.io/windmill-labs/windmill-worker-python3` with `uv pip install eurobot llm-pycascade sdmx1 pandas plotly feedparser asyncpg pymongo tenacity apscheduler` (the exact set is in `pyproject.toml`).
+The Python worker does **not** need the eurobot package — the scripts embed all domain code and only depend on published PyPI libraries. Either bake them into a custom worker image, or keep the default worker and let the scripts install them at startup — simplest is a custom image based on `ghcr.io/windmill-labs/windmill-worker-python3` with `uv pip install llm-pycascade sdmx1 pandas plotly feedparser asyncpg pymongo requests tenacity`.
 
 ## Local E2E test
 

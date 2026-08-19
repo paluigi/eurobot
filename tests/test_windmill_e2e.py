@@ -199,6 +199,9 @@ def _fake_fetchers(monkeypatch, seed: int = 42):
 def _fake_llm(monkeypatch):
     import llm_report
 
+    # keys normally come from Windmill variables — stub the fetcher
+    monkeypatch.setattr(llm_report.wmill, "get_variable", lambda path: "test-key")
+
     responses = [
         '["DATA_CISS", "DATA_IT_10Y_YIELD", "NEWS_001"]',
         '{"title": "Italian yields steady", "summary": "sum", "tags": ["bonds"],'
@@ -213,18 +216,16 @@ def _fake_llm(monkeypatch):
     monkeypatch.setattr(llm_report, "query_llm_dict", fake_query)
 
 
-async def _run_flow(dry_run: bool = True) -> dict:
+def _run_flow(dry_run: bool = True) -> dict:
     import compute_stats
     import fetch_data
     import llm_report
     import publish_archive
 
-    r1 = await fetch_data.main(PG_DSN, MONGO_URI)
-    r2 = await compute_stats.main(PG_DSN, MONGO_URI, r1["run_id"])
-    r3 = await llm_report.main(
-        MONGO_URI, r1["run_id"], {"providers": {}, "cascades": {}}
-    )
-    r4 = await publish_archive.main(
+    r1 = fetch_data.main(PG_DSN, MONGO_URI)
+    r2 = compute_stats.main(PG_DSN, MONGO_URI, r1["run_id"])
+    r3 = llm_report.main(MONGO_URI, r1["run_id"])
+    r4 = publish_archive.main(
         PG_DSN,
         MONGO_URI,
         r1["run_id"],
@@ -247,7 +248,7 @@ def test_full_flow(databases, monkeypatch):
     _fake_fetchers(monkeypatch)
     _fake_llm(monkeypatch)
 
-    results = asyncio.run(_run_flow(dry_run=True))
+    results = _run_flow(dry_run=True)
     run_id = results["fetch"]["run_id"]
 
     assert results["stats"]["skip"] is False
@@ -300,7 +301,7 @@ def test_full_flow(databases, monkeypatch):
     assert any(c["title"] == "CISS" for c in doc["payload"]["charts"])
 
     # ── Second run: same data → nothing fresh → skip path ─────────────
-    results2 = asyncio.run(_run_flow(dry_run=True))
+    results2 = _run_flow(dry_run=True)
     assert results2["stats"]["skip"] is True
     assert results2["llm"]["skip"] is True
     assert results2["publish"]["skipped"] is True
@@ -351,34 +352,29 @@ def test_publish_bounded_retries(databases, monkeypatch):
 
     monkeypatch.setattr(publish_archive.req_mod, "post", always_503)
 
-    async def flow():
+    def flow():
         import compute_stats
 
-        r1 = await fetch_data.main(PG_DSN, MONGO_URI)
-        await compute_stats.main(PG_DSN, MONGO_URI, r1["run_id"])
-        await llm_report.main(
-            MONGO_URI, r1["run_id"], {"providers": {}, "cascades": {}}
-        )
+        r1 = fetch_data.main(PG_DSN, MONGO_URI)
+        compute_stats.main(PG_DSN, MONGO_URI, r1["run_id"])
+        llm_report.main(MONGO_URI, r1["run_id"])
         return r1
 
-    r1 = asyncio.run(flow())
+    r1 = flow()
 
-    async def failing_publish():
-        try:
-            await publish_archive.main(
-                PG_DSN,
-                MONGO_URI,
-                r1["run_id"],
-                zzboard_api_token="t",
-                zzboard_api_endpoint="http://x/",
-                dry_run=False,
-                max_attempts=3,
-            )
-        except Exception as exc:  # PublishError after retries exhausted
-            return "stopped:" + type(exc).__name__
-        return "no-error"
-
-    outcome = asyncio.run(failing_publish())
+    try:
+        publish_archive.main(
+            PG_DSN,
+            MONGO_URI,
+            r1["run_id"],
+            zzboard_api_token="t",
+            zzboard_api_endpoint="http://x/",
+            dry_run=False,
+            max_attempts=3,
+        )
+        outcome = "no-error"
+    except Exception as exc:  # PublishError after retries exhausted
+        outcome = "stopped:" + type(exc).__name__
     assert outcome.startswith("stopped:"), outcome
     assert calls["n"] == 3, "exactly max_attempts POSTs — bounded, no infinite loop"
 

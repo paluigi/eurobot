@@ -18,7 +18,7 @@ sys.path.insert(0, str(WINDMILL_DIR))
 
 import llm_report
 import publish_archive
-from common import FlowStore
+from llm_report import FlowStore
 
 # ---------------------------------------------------------------------------
 # Retry classification (publish step)
@@ -200,6 +200,32 @@ class TestLlmReportAssembly:
             assert "draft" not in checkpoints
         finally:
             llm_report.query_llm_dict = orig
+
+
+# ---------------------------------------------------------------------------
+# Cascade config built inside llm_report (api keys → api_key_literal)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCascadeConfig:
+    def test_keys_injected_as_literal(self, monkeypatch):
+        monkeypatch.setattr(
+            llm_report.wmill, "get_variable", lambda path: "key-for-" + path
+        )
+        cfg = llm_report.build_cascade_config()
+        for name, spec in llm_report.PROVIDERS.items():
+            prov = cfg["providers"][name]
+            assert prov["api_key"] == "key-for-" + spec["api_key_variable"]
+            assert prov["api_key_literal"] is True
+            assert prov["base_url"] == spec["base_url"]
+
+    def test_cascade_shape(self, monkeypatch):
+        monkeypatch.setattr(llm_report.wmill, "get_variable", lambda path: "k")
+        cfg = llm_report.build_cascade_config()
+        entries = cfg["cascades"]["default"]["entries"]
+        assert len(entries) == 4
+        assert all(e["provider"] in llm_report.PROVIDERS for e in entries)
+        assert cfg["database"]["path"] == ":memory:"
 
 
 # ---------------------------------------------------------------------------

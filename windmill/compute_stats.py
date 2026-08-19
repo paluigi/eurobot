@@ -6,6 +6,12 @@ freshness, both backed by PostgreSQL tables), computes Δ-prev + YoY stats,
 builds Plotly charts/tables and writes everything the LLM needs into the
 MongoDB helper document.
 
+This script is fully self-contained: the PostgreSQL schema, the Mongo
+handoff helpers and all stats/chart code are defined below — no eurobot
+package, no shared module, no external files. Its only dependencies are
+published PyPI libraries, so it can be pasted into Windmill and run
+standalone.
+
 Windmill wiring:
     inputs: postgres_dsn, mongo_uri, run_id
 """
@@ -16,17 +22,14 @@ import asyncio
 import hashlib
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+import asyncpg
 import pandas as pd
-from common import FlowStore, mongo_client, pg_connect
-
-from eurobot.stats.compute import compute_stats_for_series
-from eurobot.viz.plotly_charts import (
-    make_delta_bar_chart,
-    make_line_chart,
-    make_summary_table,
-)
+import plotly.graph_objects as go
+from pymongo import AsyncMongoClient
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -36,12 +39,378 @@ logger = logging.getLogger("eurobot.windmill.stats")
 # Defaults mirror the classic pipeline config.
 NEWS_COOLDOWN_HOURS = 48
 
+# MongoDB collections used by the flow.
+DB_NAME = "eurobot"
+HELPER_COLLECTION = "flow_state"  # per-run handoff docs, dropped at the end
+
+# PostgreSQL data-layer schema (series registry, observations, news, dedup
+# state, run log, stats). Idempotent — applied on every connect.
+SCHEMA_SQL = """
+-- eurobot Windmill flow — PostgreSQL schema (data layer)
+--
+-- Raw + structured data lives here: series registry, observations, news
+-- items, dedup state and per-run stats/logs. Applied idempotently at the
+-- start of every flow run (CREATE TABLE IF NOT EXISTS).
+
+CREATE TABLE IF NOT EXISTS series (
+    tag         TEXT PRIMARY KEY,
+    title       TEXT NOT NULL,
+    source      TEXT NOT NULL,               -- ECB | ESTAT | YAHOO | COMPUTED
+    frequency   TEXT NOT NULL,               -- D | M | Q
+    unit        TEXT NOT NULL,
+    description TEXT,
+    first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS observations (
+    tag        TEXT NOT NULL REFERENCES series(tag) ON DELETE CASCADE,
+    obs_date   DATE   NOT NULL,
+    value      DOUBLE PRECISION NOT NULL,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tag, obs_date)
+);
+
+CREATE TABLE IF NOT EXISTS news_items (
+    hash       TEXT PRIMARY KEY,             -- sha256(title|link)[:16]
+    title      TEXT NOT NULL,
+    summary    TEXT,
+    link       TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Dedup state — written ONLY after a successful publish (publish_archive).
+CREATE TABLE IF NOT EXISTS news_seen (
+    hash         TEXT PRIMARY KEY,
+    first_seen   TIMESTAMPTZ NOT NULL,
+    times_posted INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS macro_releases (
+    series_key         TEXT PRIMARY KEY,
+    latest_obs_period  TEXT,
+    release_timestamp  TIMESTAMPTZ,
+    first_presented    TIMESTAMPTZ,
+    value_hash         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS run_log (
+    run_id     UUID PRIMARY KEY,
+    started_at TIMESTAMPTZ NOT NULL,
+    step       TEXT NOT NULL,                -- fetch | stats | llm | publish | done
+    status     TEXT NOT NULL,                -- running | succeeded | failed | skipped
+    detail     TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS stats (
+    run_id        UUID NOT NULL REFERENCES run_log(run_id) ON DELETE CASCADE,
+    tag          TEXT NOT NULL,
+    latest_value DOUBLE PRECISION,
+    latest_date  DATE,
+    delta_prev   DOUBLE PRECISION,
+    delta_prev_pct DOUBLE PRECISION,
+    yoy          DOUBLE PRECISION,
+    yoy_pct      DOUBLE PRECISION,
+    summary      TEXT,
+    computed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_observations_tag_date ON observations (tag, obs_date DESC);
+CREATE INDEX IF NOT EXISTS idx_stats_run ON stats (run_id);
+"""
+
+
+def utc_now_naive() -> datetime:
+    """Current UTC time as a naive datetime (PyMongo convention)."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+async def pg_connect(postgres_dsn: str) -> asyncpg.Connection:
+    """Open a raw asyncpg connection (timezone UTC)."""
+    conn = await asyncpg.connect(postgres_dsn)
+    await conn.execute("SET TIME ZONE 'UTC'")
+    return conn
+
+
+def mongo_client(mongo_uri: str) -> AsyncMongoClient:
+    """Build the async Mongo client (caller must ``await client.close()``)."""
+    return AsyncMongoClient(mongo_uri)
+
+
+class FlowStore:
+    """Helper collection that passes run documents between flow steps.
+
+    One document per ``run_id``::
+
+        { _id: run_id, step: "fetch", docs: {...}, created_at, updated_at }
+
+    ``docs`` holds whatever the previous step produced for the next one.
+    """
+
+    def __init__(self, client: AsyncMongoClient, run_id: str):
+        self._coll = client[DB_NAME][HELPER_COLLECTION]
+        self.run_id = run_id
+
+    async def create(self, first_step: str = "fetch") -> None:
+        now = utc_now_naive()
+        await self._coll.insert_one(
+            {
+                "_id": self.run_id,
+                "step": first_step,
+                "docs": {},
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+    async def update(self, step: str, docs: dict) -> None:
+        """Replace the carried docs and advance the step marker."""
+        await self._coll.update_one(
+            {"_id": self.run_id},
+            {
+                "$set": {
+                    "step": step,
+                    "docs": docs,
+                    "updated_at": utc_now_naive(),
+                }
+            },
+        )
+
+    async def load(self) -> dict | None:
+        doc = await self._coll.find_one({"_id": self.run_id})
+        if doc is not None:
+            doc.pop("_id", None)
+        return doc
+
+    @staticmethod
+    async def drop(client: AsyncMongoClient) -> None:
+        """Drop the helper collection (called after successful publish)."""
+        await client[DB_NAME][HELPER_COLLECTION].drop()
+        logger.info("Mongo helper collection '%s' dropped", HELPER_COLLECTION)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic statistics — Δ vs previous period + YoY
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SeriesStats:
+    """Computed statistics for a single series.
+
+    Attributes:
+        tag: Series tag (e.g. ``"CISS"``).
+        title: Human-readable title.
+        latest_value: Most recent observation.
+        latest_date: Date of most recent observation.
+        delta_prev: Change vs previous period.
+        delta_prev_pct: Percentage change vs previous period.
+        yoy: Change vs same period 12 months ago (levels or pp).
+        yoy_pct: YoY percentage change.
+        summary: One-sentence deterministic summary for the LLM.
+    """
+
+    tag: str
+    title: str
+    latest_value: float
+    latest_date: pd.Timestamp
+    delta_prev: float
+    delta_prev_pct: float | None
+    yoy: float | None
+    yoy_pct: float | None
+    summary: str
+
+
+# Number of periods to shift for YoY
+_FREQ_YOY_PERIODS = {
+    "D": 252,  # trading days in a year
+    "M": 12,
+    "Q": 4,
+}
+
+
+def compute_stats_for_series(
+    series: pd.Series,
+    tag: str,
+    title: str,
+    frequency: str = "M",
+) -> SeriesStats | None:
+    """Compute Δ-prev + YoY for a single series.
+
+    Returns ``None`` if the series is too short (< 2 obs for Δ, < 13 for YoY).
+    """
+    if series is None or len(series) < 2:
+        logger.warning("Stats: %s — too few observations (%d)", tag, len(series) if series is not None else 0)
+        return None
+
+    latest = series.iloc[-1]
+    latest_date = series.index[-1]
+
+    # Δ vs previous period
+    prev = series.iloc[-2]
+    delta_prev = latest - prev
+    delta_prev_pct = (delta_prev / abs(prev) * 100) if prev != 0 else None
+
+    # YoY
+    yoy_periods = _FREQ_YOY_PERIODS.get(frequency, 12)
+    yoy = None
+    yoy_pct = None
+    if len(series) > yoy_periods:
+        yoy_base = series.iloc[-1 - yoy_periods]
+        yoy = latest - yoy_base
+        yoy_pct = (yoy / abs(yoy_base) * 100) if yoy_base != 0 else None
+
+    # Build summary string
+    delta_str = f"{delta_prev:+.2f}" if abs(delta_prev) < 100 else f"{delta_prev:+.1f}"
+    summary_parts = [f"{title}: latest {latest:.2f} ({latest_date.strftime('%Y-%m-%d')})"]
+    summary_parts.append(f"Δ {delta_str}")
+    if yoy is not None:
+        summary_parts.append(f"YoY {yoy:+.2f}")
+    summary = " ".join(summary_parts)
+
+    return SeriesStats(
+        tag=tag,
+        title=title,
+        latest_value=float(latest),
+        latest_date=latest_date,
+        delta_prev=float(delta_prev),
+        delta_prev_pct=delta_prev_pct,
+        yoy=float(yoy) if yoy is not None else None,
+        yoy_pct=float(yoy_pct) if yoy_pct is not None else None,
+        summary=summary,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plotly chart and table generation
+#
+# For every data series: a line chart (time-series path), a summary table
+# (current value, Δ prev, YoY) and — across series — a Δ bar chart. Each is
+# returned as a ready-to-embed dict conforming to the zzboard ``charts`` or
+# ``tables`` array entry format.
+# ---------------------------------------------------------------------------
+
+_PLOTLY_TEMPLATE = "plotly_white"
+
+
+def _fmt(val: float | None, unit: str = "") -> str:
+    """Format a value for table display."""
+    if val is None:
+        return "—"
+    if abs(val) >= 100:
+        return f"{val:,.1f} {unit}".strip()
+    return f"{val:+.2f} {unit}".strip() if "Δ" not in unit else f"{val:+.2f} {unit}".strip()
+
+
+def make_line_chart(
+    series: pd.Series,
+    tag: str,
+    title: str,
+    y_title: str = "",
+) -> dict[str, Any]:
+    """Create a line-chart zzboard chart entry from a time-series.
+
+    Returns ``{"title": ..., "spec": {Plotly spec}}``.
+    """
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=series.index,
+        y=series.values,
+        mode="lines+markers",
+        line={"color": "#0d6efd", "width": 2},
+        marker={"size": 4},
+        name=title,
+    ))
+    fig.update_layout(
+        template=_PLOTLY_TEMPLATE,
+        xaxis={"title": "Date"},
+        yaxis={"title": y_title or title},
+        margin={"l": 40, "r": 20, "t": 30, "b": 30},
+        height=350,
+    )
+    return {
+        "tag": f"CHART_{tag}",
+        "title": title,
+        "spec": fig.to_dict(),
+    }
+
+
+def make_summary_table(
+    stats: SeriesStats,
+    tag: str,
+) -> dict[str, Any]:
+    """Create a summary-table zzboard entry from computed stats.
+
+    Returns ``{"tag": ..., "title": ..., "rows": [...]}``.
+    """
+    rows = [
+        {"Metric": "Latest value", "Value": f"{stats.latest_value:.2f}"},
+        {"Metric": "Date", "Value": stats.latest_date.strftime("%Y-%m-%d")},
+        {"Metric": "Δ vs previous", "Value": _fmt(stats.delta_prev)},
+        {"Metric": "Δ vs previous (%)", "Value": _fmt(stats.delta_prev_pct)},
+        {"Metric": "YoY change", "Value": _fmt(stats.yoy)},
+        {"Metric": "YoY change (%)", "Value": _fmt(stats.yoy_pct)},
+    ]
+    return {
+        "tag": f"TABLE_{tag}",
+        "title": f"{stats.title} — summary",
+        "rows": rows,
+    }
+
+
+def make_delta_bar_chart(
+    all_stats: list[SeriesStats],
+    tag: str = "ALL_DELTA",
+    title: str = "Euro-area indicators — latest change vs previous period",
+) -> dict[str, Any]:
+    """Create a bar chart comparing Δ-prev across all series.
+
+    Useful as a single overview chart in the post.
+    """
+    if not all_stats:
+        return {}
+
+    fig = go.Figure()
+    tags = [s.tag for s in all_stats]
+    deltas = [s.delta_prev for s in all_stats]
+
+    colors = ["#198754" if d >= 0 else "#dc3545" for d in deltas]
+
+    fig.add_trace(go.Bar(
+        x=tags,
+        y=deltas,
+        marker_color=colors,
+        text=[f"{d:+.2f}" for d in deltas],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        template=_PLOTLY_TEMPLATE,
+        xaxis={"title": "Indicator"},
+        yaxis={"title": "Δ vs previous period"},
+        margin={"l": 40, "r": 20, "t": 30, "b": 40},
+        height=350,
+    )
+    tag_id = f"CHART_{tag}"
+    return {
+        "tag": tag_id,
+        "title": title,
+        "spec": fig.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — stats/charts/tables + freshness filter
+# ---------------------------------------------------------------------------
+
 
 def _value_hash(series: pd.Series) -> str:
     return hashlib.sha256(series.tail(5).round(4).to_json().encode()).hexdigest()[:16]
 
 
-async def main(
+async def _main(
     postgres_dsn: str,
     mongo_uri: str,
     run_id: str,
@@ -51,6 +420,7 @@ async def main(
     conn = await pg_connect(postgres_dsn)
     client = mongo_client(mongo_uri)
     try:
+        await conn.execute(SCHEMA_SQL)  # idempotent
         await conn.execute(
             "UPDATE run_log SET step='stats', status='running', updated_at=now()"
             " WHERE run_id=$1",
@@ -266,3 +636,15 @@ async def main(
     finally:
         await conn.close()
         await client.close()
+
+
+def main(
+    postgres_dsn: str,
+    mongo_uri: str,
+    run_id: str,
+    news_cooldown_hours: int = NEWS_COOLDOWN_HOURS,
+) -> dict:
+    """Sync Windmill entrypoint (workers call ``main`` without awaiting)."""
+    return asyncio.run(
+        _main(postgres_dsn, mongo_uri, run_id, news_cooldown_hours)
+    )

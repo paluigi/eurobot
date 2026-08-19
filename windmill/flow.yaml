@@ -4,15 +4,16 @@
 #   wmill flow create u/eurobot/daily_post --path windmill/flow.yaml
 #
 # Workspace variables required (Settings → Variables, path u/eurobot/*):
-#   postgres_dsn   — postgres://user:pass@host:5432/eurobot
-#   mongo_uri      — mongodb://user:pass@host:27017
-#   zzboard_token  — secret API token
-#   cascade_config — JSON dict (llm-pycascade >=0.2.0 dict schema, see
-#                    windmill/README.md)
+#   postgres_dsn    — postgres://user:pass@host:5432/eurobot
+#   mongo_uri       — mongodb://user:pass@host:27017
+#   zzboard_token   — secret API token
+#   groq_api_key    — secret (fetched by llm_report via wmill.get_variable)
+#   together_api_key — secret (fetched by llm_report via wmill.get_variable)
 #
 # The four step scripts (fetch_data, compute_stats, llm_report,
-# publish_archive) and common.py must be synced to the workspace at
-# u/eurobot/* (windmill/README.md has the wmill sync commands).
+# publish_archive) are fully self-contained — schema, helpers and all
+# domain code inline; only published PyPI dependencies. Sync them to the
+# workspace at u/eurobot/* (windmill/README.md has the wmill sync commands).
 
 summary: eurobot — fetch → stats → LLM report → publish + archive
 description: |
@@ -56,7 +57,7 @@ value:
             expr: results.fetch.run_id
 
     - id: llm
-      summary: 3-stage LLM report (dict cascade config)
+      summary: 3-stage LLM report (cascade config defined in the script)
       value:
         type: script
         path: u/eurobot/llm_report
@@ -67,9 +68,6 @@ value:
           run_id:
             type: javascript
             expr: results.fetch.run_id
-          cascade_config:
-            type: javascript
-            expr: variable('u/eurobot/cascade_config')
           max_attempts:
             type: static
             value: 4
